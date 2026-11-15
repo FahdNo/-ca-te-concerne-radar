@@ -4,7 +4,7 @@
 Un passage = lire les flux RSS, détecter les nouveautés, regrouper les sujets,
 notifier sur Telegram, répondre aux commandes. Lancé toutes les 5 min par GitHub Actions.
 """
-import calendar 
+import calendar
 import hashlib
 import html
 import json
@@ -289,7 +289,7 @@ def score_story(db, sid):
     return min(score, 10), len(sources)
 
 
-def process(db, results, now):
+def process(db, results, now, first_run=False):
     """Insère les nouveautés. Retourne l'ensemble des sujets touchés."""
     recent = [(r["story_id"], set(r["tokens"].split())) for r in db.execute(
         "SELECT story_id, tokens FROM items WHERE pub_ts >= ?", (now - 36 * 3600,))]
@@ -302,7 +302,8 @@ def process(db, results, now):
         if db.execute("SELECT 1 FROM items WHERE id=?", (item_id,)).fetchone():
             continue
         pub_known = e["pub"] is not None
-        pub = e["pub"] if pub_known else now
+        # sans date (ex. Le Parisien) : vu pour la 1re fois = maintenant ; au tout 1er passage = ancien
+        pub = e["pub"] if pub_known else (now - 23 * 3600 if first_run else now)
         if now - pub > MAX_AGE_H * 3600:
             continue
         text = norm(e["title"] + " " + clean(e["summary"])[:300])
@@ -333,7 +334,20 @@ def esc(s):
 
 
 def hhmm(ts):
-    return datetime.fromtimestamp(ts, PARIS).strftime("%H:%M")
+    d = datetime.fromtimestamp(ts, PARIS)
+    today = datetime.now(PARIS).date()
+    if d.date() == today:
+        return d.strftime("%H:%M")
+    return ("hier " if (today - d.date()).days == 1 else d.strftime("%d/%m ")) + d.strftime("%H:%M")
+
+
+def ago(ts):
+    m = max(0, int((datetime.now(timezone.utc).timestamp() - ts) // 60))
+    if m < 1:
+        return "à l'instant"
+    if m < 60:
+        return f"il y a {m} min"
+    return f"il y a {m // 60}h{m % 60:02d}"
 
 
 def format_story(db, sid, header):
@@ -392,23 +406,25 @@ HELP = ("🤖 <b>Ça te concerne – Radar</b>\n\n/live : dernières actualités
         "/monde : international\n/urgent : alertes majeures\n/economie : économie\n/societe : société")
 
 
-def story_list(db, title, where="1=1", params=(), hours=48, limit=8):
+def story_list(db, title, where="1=1", params=(), hours=12, limit=30):
     since = int(datetime.now(timezone.utc).timestamp()) - hours * 3600
     rows = db.execute(f"""
         SELECT s.*,
           (SELECT url FROM items i WHERE i.story_id=s.id ORDER BY pub_ts LIMIT 1) AS url,
           (SELECT source FROM items i WHERE i.story_id=s.id ORDER BY pub_ts LIMIT 1) AS src,
           (SELECT COUNT(DISTINCT source) FROM items i WHERE i.story_id=s.id) AS n
-        FROM stories s WHERE s.first_ts >= ? AND {where} ORDER BY s.first_ts DESC LIMIT ?""",
+        FROM stories s WHERE s.last_ts >= ? AND {where} ORDER BY s.last_ts DESC LIMIT ?""",
         (since, *params, limit)).fetchall()
     if not rows:
-        return f"{title}\n\nRien pour le moment."
-    lines = [title, ""]
+        return [f"{title}\n\nRien sur les {hours} dernières heures."]
+    blocks = []
     for r in rows:
         mark = "🚨" if r["score"] >= LEVEL_URGENT else ("🟡" if r["score"] >= LEVEL_INTERESTING else "▫️")
-        lines.append(f'{mark} <b>{esc(r["title"])}</b>\n{r["score"]}/10 · {r["n"]} source(s) · '
-                     f'<a href="{html.escape(r["url"], quote=True)}">{esc(r["src"])}</a> · {hhmm(r["first_ts"])}')
-    return "\n\n".join([lines[0], *lines[2:]])
+        blocks.append(f'{mark} <b>{esc(r["title"])}</b>\n🕒 {ago(r["last_ts"])} · {r["score"]}/10 · '
+                      f'{r["n"]} source(s) · <a href="{html.escape(r["url"], quote=True)}">{esc(r["src"])}</a>')
+    head = f"{title} · du plus récent au plus ancien ({hours} h)"
+    chunks = [blocks[i:i + 6] for i in range(0, len(blocks), 6)]
+    return [(head + "\n\n" if i == 0 else "") + "\n\n".join(c) for i, c in enumerate(chunks)]
 
 
 def answer(db, cmd):
@@ -421,11 +437,11 @@ def answer(db, cmd):
     if cmd == "/monde":
         return story_list(db, "🌍 <b>Monde</b>", "s.country!='France'")
     if cmd == "/urgent":
-        return story_list(db, "🚨 <b>Alertes majeures</b>", "s.score>=?", (LEVEL_URGENT,))
+        return story_list(db, "🚨 <b>Alertes majeures</b>", "s.score>=?", (LEVEL_URGENT,), hours=24)
     if cmd == "/economie":
-        return story_list(db, "💶 <b>Économie</b>", "s.category='Économie'", hours=72)
+        return story_list(db, "💶 <b>Économie</b>", "s.category='Économie'", hours=24)
     if cmd == "/societe":
-        return story_list(db, "👥 <b>Société</b>", "s.category IN ('Société','Faits divers / justice')", hours=72)
+        return story_list(db, "👥 <b>Société</b>", "s.category IN ('Société','Faits divers / justice')", hours=24)
     return None
 
 
@@ -440,7 +456,8 @@ def handle_commands(db):
         cmd = (m.get("text") or "").strip().split("@")[0].split(" ")[0].lower()
         reply = answer(db, cmd)
         if reply:
-            send(reply)
+            for part in ([reply] if isinstance(reply, str) else reply):
+                send(part)
     meta_set(db, "offset", offset)
 
 
@@ -468,7 +485,7 @@ def main():
         else:
             meta_set(db, key, 0)
 
-    touched = process(db, results, now)
+    touched = process(db, results, now, first_run)
     notify(db, touched, silent=first_run)
     if first_run:
         meta_set(db, "seeded", "1")
