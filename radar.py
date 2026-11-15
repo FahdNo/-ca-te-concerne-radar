@@ -4,7 +4,7 @@
 Un passage = lire les flux RSS, détecter les nouveautés, regrouper les sujets,
 notifier sur Telegram, répondre aux commandes. Lancé toutes les 5 min par GitHub Actions.
 """
-import calendar
+import calendar 
 import hashlib
 import html
 import json
