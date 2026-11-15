@@ -2,6 +2,7 @@ name: Test bot
 
 on:
   workflow_dispatch:
+  push:
 
 jobs:
   send:
